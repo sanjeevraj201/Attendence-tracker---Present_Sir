@@ -1,0 +1,226 @@
+// STAGED SECURITY BASELINE - NOT DEPLOYED
+//
+// This project still writes the complete attendance history from the client.
+// That cannot be made trustworthy with Firestore rules: a student who may
+// write their own history can forge any attendance entry.  Consequently this
+// ruleset intentionally denies direct writes to /users/{uid}/data/subjects.
+//
+// Do not deploy it until the callable/server-side mutations described in
+// security/README.md are in place.  Keeping this file outside a root
+// firebase.json is deliberate: it prevents an accidental deployment.
+
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(uid) {
+      return signedIn() && request.auth.uid == uid;
+    }
+
+    function hasRole(role) {
+      return signedIn()
+        && exists(/databases/$(database)/documents/users/$(request.auth.uid))
+        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == role;
+    }
+
+    function isStudent() {
+      return hasRole('STUDENT');
+    }
+
+    function isFaculty() {
+      return hasRole('FACULTY');
+    }
+
+    function isAdmin() {
+      return hasRole('ADMIN');
+    }
+
+    function isAssignedFaculty(subjectCode) {
+      return isFaculty()
+        && exists(/databases/$(database)/documents/users/$(request.auth.uid)/data/facultySubjects)
+        && subjectCode in get(/databases/$(database)/documents/users/$(request.auth.uid)/data/facultySubjects).data.codes;
+    }
+
+    function ownsSession(subjectCode) {
+      return isFaculty()
+        && exists(/databases/$(database)/documents/activeSessions/$(subjectCode))
+        && get(/databases/$(database)/documents/activeSessions/$(subjectCode)).data.facultyId == request.auth.uid;
+    }
+
+    // A profile can be created only by the authenticated user, and never with
+    // a privileged role.  Provision the first ADMIN using the Admin SDK or
+    // Firebase Console; server credentials bypass these client rules.
+    match /users/{uid} {
+      allow get: if isOwner(uid) || isAdmin();
+      allow list: if isAdmin();
+
+      allow create: if isOwner(uid)
+        && request.resource.data.keys().hasOnly([
+          'uid', 'email', 'displayName', 'role', 'hasSeenTutorial'
+        ])
+        && request.resource.data.uid == uid
+        && request.resource.data.email == request.auth.token.email
+        && request.resource.data.role in ['STUDENT', 'PENDING_FACULTY']
+        && request.resource.data.hasSeenTutorial == false;
+
+      // Users can update presentation and onboarding fields only.  In
+      // particular, they cannot promote themselves or replace a bound device.
+      allow update: if isAdmin()
+        || (isOwner(uid)
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+            'displayName', 'photoUrl', 'hasSeenTutorial', 'deviceId'
+          ])
+          && (!request.resource.data.diff(resource.data).affectedKeys().hasAny(['deviceId'])
+            || !('deviceId' in resource.data)));
+
+      allow delete: if isOwner(uid) || isAdmin();
+    }
+
+    match /users/{uid}/data/subjects {
+      allow get: if isOwner(uid) || isAdmin();
+      // Attendance is authoritative data.  It must be mutated by a callable
+      // function/Admin SDK after server-side validation, never by this app.
+      allow create, update, delete: if false;
+    }
+
+    match /users/{uid}/data/timetable {
+      allow read, write: if isOwner(uid);
+    }
+
+    match /users/{uid}/data/settings {
+      allow read, write: if isOwner(uid);
+    }
+
+    match /users/{uid}/data/facultySubjects {
+      allow get: if isOwner(uid) || isAdmin();
+      allow create, update: if isAdmin();
+      allow delete: if isOwner(uid) || isAdmin();
+    }
+
+    match /users/{uid}/data/{document=**} {
+      allow read, write: if false;
+    }
+
+    match /pendingFaculty/{uid} {
+      allow get: if isOwner(uid) || isAdmin();
+      allow list: if isAdmin();
+
+      allow create: if isOwner(uid)
+        && request.resource.data.keys().hasOnly([
+          'uid', 'email', 'displayName', 'department', 'staffId', 'createdAt'
+        ])
+        && request.resource.data.uid == uid
+        && request.resource.data.email == request.auth.token.email;
+
+      allow update: if false;
+      allow delete: if isOwner(uid) || isAdmin();
+    }
+
+    match /activeSessions/{subjectCode} {
+      // The current session document contains a fallback PIN and geofence.  A
+      // future schema should split public check-in metadata from staff-only
+      // secrets; until then every signed-in student needs direct get access.
+      allow get: if signedIn();
+      allow list: if isAdmin()
+        || (isFaculty() && resource.data.facultyId == request.auth.uid);
+
+      allow create: if isAssignedFaculty(subjectCode)
+        && request.resource.data.facultyId == request.auth.uid
+        && request.resource.data.subjectCode == subjectCode;
+
+      allow update: if isAssignedFaculty(subjectCode)
+        && resource.data.facultyId == request.auth.uid
+        && request.resource.data.facultyId == request.auth.uid
+        && request.resource.data.subjectCode == subjectCode;
+
+      allow delete: if false;
+
+      match /records/{studentUid} {
+        allow get, list: if isAdmin() || ownsSession(subjectCode);
+
+        // Radar records are evidence only, not attendance authority.  Location
+        // and device identifiers supplied by a client cannot be trusted.
+        allow create: if isStudent()
+          && studentUid == request.auth.uid
+          && request.resource.data.uid == request.auth.uid
+          && request.resource.data.keys().hasAll([
+            'uid', 'studentName', 'deviceId', 'lat', 'lng', 'timestamp',
+            'attendanceType', 'isFlagged'
+          ])
+          && request.resource.data.keys().hasOnly([
+            'uid', 'studentName', 'deviceId', 'lat', 'lng', 'timestamp',
+            'attendanceType', 'isFlagged', 'flagReason'
+          ])
+          && request.resource.data.attendanceType == 'PRESENT'
+          && request.resource.data.isFlagged == false
+          && get(/databases/$(database)/documents/activeSessions/$(subjectCode)).data.status == 'ACTIVE';
+
+        allow update: if (isStudent()
+            && studentUid == request.auth.uid
+            && resource.data.uid == request.auth.uid
+            && request.resource.data.uid == request.auth.uid
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+              'studentName', 'deviceId', 'lat', 'lng', 'timestamp'
+            ]))
+          || (ownsSession(subjectCode)
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+              'isFlagged', 'flagReason'
+            ]));
+
+        allow delete: if false;
+      }
+    }
+
+    match /odmlRequests/{requestId} {
+      allow get, list: if isAdmin()
+        || isOwner(resource.data.studentId)
+        || isAssignedFaculty(resource.data.subjectCode);
+
+      allow create: if isStudent()
+        && request.resource.data.studentId == request.auth.uid
+        && request.resource.data.requestId == requestId
+        && request.resource.data.status == 'PENDING';
+
+      // A student may only remove dates from their still-pending request.
+      allow update: if isOwner(resource.data.studentId)
+        && resource.data.status == 'PENDING'
+        && request.resource.data.status == 'PENDING'
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['dates']);
+
+      allow delete: if isOwner(resource.data.studentId)
+        && resource.data.status == 'PENDING';
+
+      // Approval must atomically change attendance, request status, and audit
+      // data in a privileged callable function.  Do not permit it in a client.
+    }
+
+    match /correctionRequests/{requestId} {
+      allow get, list: if isAdmin()
+        || isOwner(resource.data.studentId)
+        || isAssignedFaculty(resource.data.subjectCode);
+
+      allow create: if isStudent()
+        && request.resource.data.studentId == request.auth.uid
+        && request.resource.data.requestId == requestId
+        && request.resource.data.status == 'PENDING';
+
+      // Resolve correction requests in a callable function so the attendance
+      // mutation and audit log cannot be split by a malicious client.
+      allow update, delete: if false;
+    }
+
+    match /attendanceAuditLog/{logId} {
+      allow get, list: if isAdmin();
+      allow create, update, delete: if false;
+    }
+
+    // New collections are private until their access policy is designed.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
